@@ -1,180 +1,416 @@
-# Campus Notification System Design
+# Stage 1
 
-## Stage 1: API & Real-time Design
+## REST API design
 
-### REST API Endpoints
-**1. GET /notifications**
-*   **Request**: `GET /notifications?page=1&limit=10&notification_type=Placement`
-*   **Headers**: `Authorization: Bearer <token>`
-*   **Response**:
-    ```json
+Assumptions:
+- Auth via Bearer token.
+- Notifications are per-student, but some are global (broadcast) and fanned out to per-student read state.
+
+### Endpoints
+
+| Action | Method | Endpoint | Notes |
+| --- | --- | --- | --- |
+| Fetch notifications | GET | /v1/notifications | Filters, pagination, unread-only |
+| Mark as read | PATCH | /v1/notifications/{id}/read | Idempotent |
+| Create notification | POST | /v1/notifications | Admin/system only |
+| Real-time stream | GET | /v1/notifications/stream | SSE |
+
+### Headers
+
+```
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: <uuid>  // for POST
+```
+
+### Fetch notifications
+
+```
+GET /v1/notifications?type=Placement&unread=true&limit=20&cursor=eyJpZCI6MTIzfQ==
+```
+
+Response:
+
+```json
+{
+  "data": [
     {
-      "total": 1500,
-      "page": 1,
-      "limit": 10,
-      "data": [
-        {
-          "id": "1",
-          "type": "Placement",
-          "content": "Google Interview Scheduled",
-          "timestamp": "2023-10-25T10:00:00Z"
-        }
-      ]
+      "id": 9876,
+      "studentId": 1042,
+      "type": "Placement",
+      "title": "Interview scheduled",
+      "body": "Google round 2 on May 7",
+      "createdAt": "2026-05-05T09:10:00Z",
+      "readAt": null
     }
-    ```
+  ],
+  "page": {
+    "limit": 20,
+    "nextCursor": "eyJpZCI6OTg3Nn0=",
+    "hasMore": true
+  }
+}
+```
 
-**2. GET /notifications/priority**
-*   **Request**: `GET /notifications/priority`
-*   **Headers**: `Authorization: Bearer <token>`
-*   **Response**:
-    ```json
-    {
-      "data": [
-        {
-          "id": "2",
-          "type": "Placement",
-          "content": "Amazon final round",
-          "timestamp": "2023-10-26T12:00:00Z"
-        }
-      ]
-    }
-    ```
+### Mark as read
 
-### Real-Time Mechanism Design
-**Choice: Server-Sent Events (SSE)**
-*   **Justification**: Notifications are inherently a one-way communication stream (Server -> Client). SSE is built specifically for this and operates natively over standard HTTP without the overhead of the two-way duplexing required by WebSockets. It also handles automatic reconnections and is much simpler to implement and proxy through standard load balancers. WebSockets would be overkill since the client doesn't need to send high-frequency events back to the server (read receipts can just be standard REST calls).
+```
+PATCH /v1/notifications/9876/read
+```
 
----
+Response:
 
-## Stage 2: Database Design & Scaling
+```json
+{
+  "id": 9876,
+  "readAt": "2026-05-05T10:01:00Z"
+}
+```
 
-**Database Choice: PostgreSQL**
-*   **Justification**: PostgreSQL is an advanced relational database that guarantees strict ACID compliance, which is critical for read/unread state accuracy. It also supports advanced indexing (like composite and partial indices) and JSONB formats if schemas for different notification types diverge. 
+### Create notification
 
-### Schema
+```
+POST /v1/notifications
+```
+
+Request:
+
+```json
+{
+  "audience": "students",
+  "targetStudentIds": [1042, 1050],
+  "type": "Event",
+  "title": "Tech Talk",
+  "body": "Auditorium B at 4 PM",
+  "priority": "normal"
+}
+```
+
+Response:
+
+```json
+{
+  "notificationId": 10022,
+  "fanoutStatus": "queued"
+}
+```
+
+### Filtering + pagination
+
+Supported filters:
+
+| Filter | Example | Notes |
+| --- | --- | --- |
+| type | type=Placement | enum Placement, Result, Event |
+| unread | unread=true | unread only |
+| since | since=2026-05-01T00:00:00Z | lower bound |
+| limit | limit=20 | max 100 |
+| cursor | cursor=... | opaque cursor for keyset pagination |
+
+### Real-time mechanism
+
+Use SSE for one-way delivery.
+
+```
+GET /v1/notifications/stream
+Accept: text/event-stream
+```
+
+Event payload:
+
+```json
+{
+  "id": 10022,
+  "type": "Placement",
+  "title": "Offer released",
+  "body": "Please check portal",
+  "createdAt": "2026-05-05T10:05:00Z"
+}
+```
+
+Rationale: SSE is simpler than WebSockets for a server-to-client stream, plays well with HTTP infrastructure, and supports automatic reconnects. If we need bidirectional interactions later, we can add WebSockets without breaking clients.
+
+# Stage 2
+
+## Database design
+
+**DB choice: PostgreSQL**
+- Strong consistency for read/unread tracking.
+- Composite + partial indexes are critical for unread queries.
+- Supports partitioning and JSONB for flexible notification metadata.
+
+### Core schema
+
 ```sql
 CREATE TABLE students (
-    student_id SERIAL PRIMARY KEY,
+    id BIGSERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL
 );
 
 CREATE TABLE notifications (
-    id SERIAL PRIMARY KEY,
-    type VARCHAR(50) NOT NULL, -- 'Placement', 'Result', 'Event'
-    content TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id BIGSERIAL PRIMARY KEY,
+    type VARCHAR(20) NOT NULL, -- Placement | Result | Event
+    title VARCHAR(255) NOT NULL,
+    body TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE notification_reads (
-    student_id INT REFERENCES students(student_id),
-    notification_id INT REFERENCES notifications(id),
-    is_read BOOLEAN DEFAULT false,
+    student_id BIGINT NOT NULL REFERENCES students(id),
+    notification_id BIGINT NOT NULL REFERENCES notifications(id),
+    read_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (student_id, notification_id)
 );
 ```
 
-### Queries matching Stage 1
-**GET /notifications**
+### Indexes
+
 ```sql
-SELECT n.id, n.type, n.content, n.created_at, nr.is_read
-FROM notifications n
-JOIN notification_reads nr ON n.id = nr.notification_id
-WHERE nr.student_id = $1 AND n.type = $2
+-- Fast unread lookup by student
+CREATE INDEX idx_notification_reads_unread
+ON notification_reads (student_id, created_at DESC)
+WHERE read_at IS NULL;
+
+-- Fetch notifications by type and time
+CREATE INDEX idx_notifications_type_created
+ON notifications (type, created_at DESC);
+
+-- Join acceleration
+CREATE INDEX idx_notification_reads_notification
+ON notification_reads (notification_id);
+```
+
+### Scaling concerns and mitigation
+
+| Problem | Why it hurts | Mitigation |
+| --- | --- | --- |
+| Huge `notification_reads` | Explodes per-student rows | Partition by student_id hash or by time; archive old read rows |
+| Unread queries slow | Needs read_at filter + order | Partial index on unread rows |
+| High fanout cost | Broadcast to all students | Queue-driven fanout + batch inserts |
+| Hot feed queries | Same recent items | Redis cache for recent pages |
+
+### SQL for Stage 1 APIs
+
+Fetch notifications (keyset pagination):
+
+```sql
+SELECT n.id, n.type, n.title, n.body, n.created_at, nr.read_at
+FROM notification_reads nr
+JOIN notifications n ON n.id = nr.notification_id
+WHERE nr.student_id = $1
+  AND ($2::text IS NULL OR n.type = $2)
+  AND ($3::timestamptz IS NULL OR n.created_at >= $3)
+  AND ($4::boolean IS NULL OR ($4 = true AND nr.read_at IS NULL))
+  AND ($5::bigint IS NULL OR n.id < $5)
+ORDER BY n.id DESC
+LIMIT $6;
+```
+
+Mark as read:
+
+```sql
+UPDATE notification_reads
+SET read_at = now()
+WHERE student_id = $1 AND notification_id = $2 AND read_at IS NULL
+RETURNING notification_id, read_at;
+```
+
+Create notification:
+
+```sql
+INSERT INTO notifications (type, title, body, metadata)
+VALUES ($1, $2, $3, $4)
+RETURNING id;
+```
+
+Fanout rows (batch):
+
+```sql
+INSERT INTO notification_reads (student_id, notification_id)
+SELECT id, $1 FROM students WHERE id = ANY($2::bigint[]);
+```
+
+# Stage 3
+
+## Query optimization
+
+Given query:
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+### Is it correct?
+- Not in the current schema. Read state is in `notification_reads`, not in `notifications`.
+
+### Why is it slow?
+- Full scan + sort if there is no composite index.
+- `SELECT *` pulls unnecessary columns, increasing IO.
+
+### Fixed query + indexes
+
+```sql
+SELECT n.id, n.type, n.title, n.body, n.created_at
+FROM notification_reads nr
+JOIN notifications n ON n.id = nr.notification_id
+WHERE nr.student_id = 1042 AND nr.read_at IS NULL
 ORDER BY n.created_at DESC
-LIMIT $3 OFFSET $4;
+LIMIT 50;
 ```
 
-### Scaling to 50k Students / 5M Notifications
-*   **Problem**: `notification_reads` table will explode in size, slowing down JOINs.
-*   **Solution**: Partition the `notification_reads` table by `student_id` or date range. Implement Redis caching for recent notifications, as older ones are rarely accessed. Move historical data to cold storage.
+Indexes:
 
----
-
-## Stage 3: Query Optimization
-
-### Analyze Slow Query
-`SELECT * FROM notifications WHERE studentID = 1042 AND isRead = false ORDER BY createdAt ASC;`
-*   **Why is it slow?**: Without an index, the database must perform a full table scan across potentially millions of rows to find those matching `studentID` and `isRead = false`, and then it must perform an expensive in-memory sort on `createdAt`.
-*   **Accurate?**: Yes, it retrieves unread notifications for a student, ordered chronologically.
-
-### Proposed Fix: Composite Index
 ```sql
-CREATE INDEX idx_student_unread_created ON notifications (studentID, isRead, createdAt) WHERE isRead = false;
+CREATE INDEX idx_nr_student_unread_created
+ON notification_reads (student_id, created_at DESC)
+WHERE read_at IS NULL;
 ```
 
-### Why Indexing Every Column is Bad
-Indexing every column significantly degrades write performance (INSERT/UPDATE/DELETE) because every index must be updated synchronously. It also inflates the database storage size dramatically.
+### Complexity improvement
+- Before: $O(N)$ scan + $O(M \log M)$ sort.
+- After: $O(\log N)$ index seek + $O(K)$ for top K results.
 
-### Query for Recent Placement Notifications
+### Why not index every column?
+- Every extra index slows writes and inflates storage.
+- Many indexes are unused but still maintained.
+- It can confuse the planner and lead to suboptimal plans.
+
+### Students who received Placement notifications in last 7 days
+
 ```sql
-SELECT DISTINCT s.student_id, s.name
+SELECT DISTINCT s.id, s.name
 FROM students s
-JOIN notification_reads nr ON s.student_id = nr.student_id
-JOIN notifications n ON nr.notification_id = n.id
-WHERE n.type = 'Placement' AND n.created_at >= NOW() - INTERVAL '7 days';
+JOIN notification_reads nr ON nr.student_id = s.id
+JOIN notifications n ON n.id = nr.notification_id
+WHERE n.type = 'Placement'
+  AND n.created_at >= now() - interval '7 days';
 ```
 
----
+# Stage 4
 
-## Stage 4: Frontend & Delivery Strategies
+## Performance optimization
 
-*   **Redis Caching**: Highly effective for repeated identical queries (e.g., getting the top Priority notifications that are globally identical for many students).
-    *   *Tradeoffs*: Cache invalidation can be tricky; data might be slightly stale.
-*   **Pagination**: Good for structured historical browsing.
-    *   *Tradeoffs*: `OFFSET` based pagination gets slower as pages go deeper.
-*   **Lazy Loading / Infinite Scroll**: Great UX for mobile/feeds. 
-    *   *Tradeoffs*: Harder to bookmark or jump to a specific past state.
-*   **WebSocket Push (or SSE)**: Delivers notifications instantly.
-    *   *Tradeoffs*: Requires persistent connections which consume server memory and complicates load balancing/scaling.
+Problem: DB overload from fetching notifications on every page load.
 
----
+### Solutions and trade-offs
 
-## Stage 5: Asynchronous Processing
+| Solution | Benefit | Trade-off |
+| --- | --- | --- |
+| Redis cache | Offloads frequent reads, fast | Staleness, invalidation complexity |
+| Pagination (keyset) | Small result sets, stable | Cannot jump to arbitrary page number |
+| SSE/WebSockets | Push instead of pull | Persistent connections, infra tuning |
+| Read replicas | Offload read traffic | Replica lag, operational cost |
 
-### Critique of Synchronous notify_all()
-If `notify_all()` iterates synchronously over 50,000 students, the HTTP request will time out. If the loop crashes at student 201 (e.g., due to an email API error), the remaining 49,799 students will never receive the notification.
+Practical approach: cache last 50 notifications per student in Redis, keyset pagination for history, and SSE for new items. This removes the "poll on every load" behavior while keeping UX snappy.
 
-### Redesign: Message Queue (Kafka/RabbitMQ)
-DB inserts and email sending should be completely decoupled. The web server should instantly insert the DB record and then publish a message to a queue. Background worker processes consume the queue to handle the slow, error-prone email API calls independently.
+# Stage 5
 
-### Revised Pseudocode
+## Scalability and reliability
+
+### Problems with naive sequential processing
+- HTTP request blocks while sending thousands of emails.
+- One failure stops the loop; partial delivery is common.
+- No retry or idempotency guarantees.
+
+### Improved design
+- Write notification to DB.
+- Enqueue fanout task to message queue.
+- Worker batches fanout and email delivery.
+- Retry with exponential backoff; DLQ for poison messages.
+- Idempotency key per notification to avoid duplicates.
+
+### What if email fails for 200 users?
+- Those 200 jobs are retried independently.
+- Unaffected users still receive the notification.
+- After max retries, jobs go to DLQ for manual re-drive.
+
+### Should DB + email happen together?
+- No. DB write must succeed first. Email delivery is async and eventually consistent.
+- Use outbox pattern to avoid missing events between DB write and queue publish.
+
+### Pseudocode
+
 ```python
-def create_notification(type, content):
-    # 1. Insert into DB (Fast)
-    db.insert(Notification(type=type, content=content))
-    
-    # 2. Publish event to queue
-    message_queue.publish('notification_events', {
-        "type": type,
-        "content": content
-    })
-    return "Notification queued"
+def create_notification(payload, idempotency_key):
+    if db.outbox_exists(idempotency_key):
+        return "duplicate"
 
-# Background Worker Process
-def worker():
-    while True:
-        msg = message_queue.consume('notification_events')
-        students = db.get_all_students()
+    with db.transaction():
+        notif_id = db.insert_notification(payload)
+        db.insert_outbox({
+            "idempotency_key": idempotency_key,
+            "notification_id": notif_id
+        })
+
+def outbox_publisher():
+    for event in db.fetch_unpublished_outbox(limit=100):
+        queue.publish("fanout", event)
+        db.mark_outbox_published(event.id)
+
+def fanout_worker():
+    for event in queue.consume("fanout"):
+        students = db.get_target_students(event.notification_id)
+        db.batch_insert_reads(students, event.notification_id)
         for student in students:
-            try:
-                email_service.send(student.email, msg.content)
-            except EmailException:
-                # Retry logic: send back to queue or DLQ
-                message_queue.publish('retry_queue', { "student": student.id, "msg": msg })
+            queue.publish("email", {
+                "notification_id": event.notification_id,
+                "student_id": student.id
+            })
+
+def email_worker():
+    for job in queue.consume("email"):
+        email.send(job.student_id, job.notification_id)
 ```
 
----
+# Stage 6
 
-## Stage 6: Priority Algorithm
+## Priority notifications logic (JavaScript)
 
-### Weight + Recency Algorithm
-1.  Assign base weights: `Placement = 3`, `Result = 2`, `Event = 1`.
-2.  If weights differ, higher weight wins.
-3.  If weights are equal, standard timestamp comparison acts as the tie-breaker (`DESC` - newest wins).
+Priority order: Placement > Result > Event. Recency breaks ties.
 
-### Maintaining Top-N Efficiently
-Instead of sorting all `N` elements continuously (`O(N log N)`), we can use a **Min-Heap of size K** (where K is the top N needed, e.g., 10).
-*   As new notifications arrive, they are compared against the root of the min-heap (the *lowest* priority item currently in our Top K).
-*   If the new notification is higher priority, the root is popped and the new item is pushed. 
-*   This keeps insertions at `O(log K)`. For `K=10`, this is virtually `O(1)`. This handles a real-time stream of millions of events perfectly without full re-sorting.
+### Implementation
+
+```javascript
+const PRIORITY_SCORE = {
+  Placement: 3,
+  Result: 2,
+  Event: 1
+};
+
+function compareNotif(a, b) {
+  const pa = PRIORITY_SCORE[a.type] || 0;
+  const pb = PRIORITY_SCORE[b.type] || 0;
+  if (pa !== pb) return pb - pa;
+  return new Date(b.createdAt) - new Date(a.createdAt);
+}
+
+async function fetchTop10Priority() {
+  const res = await fetch(
+    "http://20.207.122.201/evaluation-service/notifications"
+  );
+  if (!res.ok) throw new Error("Failed to fetch notifications");
+  const data = await res.json();
+
+  const items = Array.isArray(data) ? data : data.data;
+  if (!Array.isArray(items)) return [];
+
+  // Sort once for simplicity; O(N log N) is acceptable for moderate N.
+  return items.sort(compareNotif).slice(0, 10);
+}
+
+module.exports = { fetchTop10Priority };
+```
+
+### Maintain top-N efficiently as new data arrives
+
+Use a min-heap of size K=10 with the inverse comparator. For each new notification:
+- If heap size < K, push.
+- Else compare with root; if higher priority, pop + push.
+- This keeps updates at $O(\log K)$.
+
+If the stream is high-volume, this avoids re-sorting the full list on every update.
